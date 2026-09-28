@@ -4,7 +4,7 @@ import { initializeApp } from 'firebase/app';
 import {
   getFirestore, doc, getDoc, setDoc,
   initializeFirestore, persistentLocalCache,
-  collection, getDocs, onSnapshot, deleteDoc, writeBatch,
+  collection, getDocs, getDocsFromServer, onSnapshot, deleteDoc, writeBatch,
   query, where, orderBy, limit,
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously } from 'firebase/auth';
@@ -254,6 +254,15 @@ interface FilaHistorialSolicitud {
   generadoEn: string;
   entregadoPor: string;
   entregadoEn: string;
+  // AGREGADO 26/9/2026 (pedido explícito — "poneme un botón de eliminar a cada archivo [de
+  // Historial], pero que pida pin y el motivo... y se registre eliminado por tal motivo tal y
+  // fecha y hora, así queda arqueado"): la fila NUNCA se borra de verdad (ver comentario arriba —
+  // sigue siendo la planilla permanente), solo se marca. Queda visible tachada, con quién, cuándo
+  // y por qué, en vez de desaparecer del arqueo.
+  eliminado?: boolean;
+  eliminadoEn?: string;
+  eliminadoPor?: string;
+  motivoEliminacion?: string;
 }
 async function registrarHistorialSolicitud(sol: SolicitudRiego) {
   if (sol.estado !== 'cerrado' || !sol.cerradoEn) return;
@@ -264,7 +273,7 @@ async function registrarHistorialSolicitud(sol: SolicitudRiego) {
         id: `${sol.id}_${i}`,
         solicitudId: sol.id,
         origen: sol.origen,
-        numeroOrden: sol.origen === 'maquinaria' ? (sol.otNumero || '') : (sol.otRiegoNumero || ''),
+        numeroOrden: sol.origen === 'maquinaria' ? (sol.otNumero || '') : otRiegoLimpia(sol.otRiegoNumero),
         pivoteOMaquina: sol.origen === 'maquinaria' ? (sol.maquina || '') : (sol.pivot || ''),
         lotes: sol.lotes || [],
         producto: p.nombre,
@@ -320,6 +329,10 @@ function exportarHistorialSolicitudesExcel(filas: FilaHistorialSolicitud[]) {
     'Generó': f.generadoPor,
     'Fecha generación': f.generadoEn ? new Date(f.generadoEn).toLocaleString('es-BO', { hour12: false }) : '',
     'Entregó': f.entregadoPor,
+    'Estado': f.eliminado ? 'Eliminado' : 'Vigente',
+    'Eliminado por': f.eliminado ? (f.eliminadoPor || '') : '',
+    'Fecha eliminación': f.eliminado && f.eliminadoEn ? new Date(f.eliminadoEn).toLocaleString('es-BO', { hour12: false }) : '',
+    'Motivo eliminación': f.eliminado ? (f.motivoEliminacion || '') : '',
   }));
   const ws = XLSX.utils.json_to_sheet(datos);
   const wb = XLSX.utils.book_new();
@@ -2137,7 +2150,7 @@ function exportarAExcel(
     'Stock después': m.stockDespues,
     'Pivote/Máquina': m.pivot || m.maquina || '',
     'N° OT': m.otNumero || '',
-    'OT Riego': m.otRiegoNumero || '',
+    'OT Riego': otRiegoLimpia(m.otRiegoNumero),
     Lotes: (m.lotes || []).join(', '),
     Responsable: m.responsable || '',
     Observaciones: m.observaciones || '',
@@ -2280,7 +2293,7 @@ function TarjetaResumenOT({ ot, predictivo }: { ot: OT; predictivo?: Predictivo 
 // realmente (no el estimado), para compartir por WhatsApp o guardar como imagen.
 function TarjetaComprobanteEntrega({ sol }: { sol: SolicitudRiego }) {
   const origenTxt = sol.origen === 'maquinaria' ? `🚜 ${sol.maquina}` : `💧 ${sol.pivot}`;
-  const otTxt = sol.origen === 'maquinaria' ? (sol.otNumero || '—') : (sol.otRiegoNumero || '—');
+  const otTxt = sol.origen === 'maquinaria' ? (sol.otNumero || '—') : (otRiegoLimpia(sol.otRiegoNumero) || '—');
   return (
     <div style={{ width: 320, fontFamily: 'Arial,sans-serif', background: '#fff', border: '2px solid #0f766e', borderRadius: 10, overflow: 'hidden' }}>
       <div style={{ background: '#0f766e', color: '#fff', padding: '8px 12px' }}>
@@ -2331,7 +2344,7 @@ function TarjetaOTPivoteCreada({ ot }: { ot: OTPivote }) {
     <div style={{ width: 320, fontFamily: 'Arial,sans-serif', background: '#fff', border: '2px solid #0284c7', borderRadius: 10, overflow: 'hidden' }}>
       <div style={{ background: '#0284c7', color: '#fff', padding: '8px 12px' }}>
         <div style={{ fontSize: 11 }}>🌿 AGRIFUMIGA → RIEGO</div>
-        <div style={{ fontSize: 15, fontWeight: 700 }}>OT PIVOTE — PEDIDO DE APLICACIÓN</div>
+        <div style={{ fontSize: 15, fontWeight: 700 }}>OT PIVOTE{ot.numeroOT ? ` — N° ${ot.numeroOT}` : ''} — PEDIDO DE APLICACIÓN</div>
       </div>
       <div style={{ padding: '8px 12px', background: '#f0f9ff', borderBottom: '1px solid #bae6fd', fontSize: 12 }}>
         <div><strong>Pivote:</strong> {ot.pivote}</div>
@@ -3612,6 +3625,8 @@ export default function App() {
             rol={rol}
             campanaActiva={campanaActiva}
             usuarioActivo={usuarioActivo}
+            rangosFolios={rangosFolios}
+            folioHistorial={folioHistorial}
           />
         )}
         {pestana === 'archivo' && (
@@ -7150,6 +7165,16 @@ function direccionViento(grados: number): string {
 // reload sin avisar es exactamente el riesgo que causó la pérdida de un
 // predictivo (F5/recarga justo en medio de un guardado). Esto solo muestra
 // un banner con un botón; la persona decide cuándo es un buen momento.
+// REVERTIDO 24/9/2026: entre el 24/9 hubo un cambio acá (agregar una escritura automática de
+// `config/app_version` cuando entra un Maestro) por una suposición mía equivocada — a partir de
+// solo leer este archivo asumí que nada escribía ese documento nunca, y no era cierto: el usuario
+// confirmó que el aviso "nueva versión" YA funciona hoy con su `publicar.bat` tal cual, así que
+// ESE script (que no está en este archivo, no lo puedo ver) ya lo escribe por su cuenta —
+// probablemente con el Admin SDK o la CLI de Firebase como parte del publish, fuera del código
+// del navegador. Agregar acá una segunda escritura hubiera creado dos "escritores" del mismo
+// documento con la posibilidad real de pisarse uno al otro (ver el propio riesgo que quedó
+// documentado en el commit anterior) — sin necesidad, porque lo que ya tenían andaba bien. Vuelve
+// a ser de solo lectura.
 function AvisoNuevaVersion() {
   const [versionServidor, setVersionServidor] = useState<string | null>(null);
 
@@ -9258,6 +9283,12 @@ interface MovimientoAlmacen {
   observaciones: string;
   fecha: string;
   creadoEn: string;
+  // AGREGADO 26/9/2026 (ver `eliminarFilaHistorial`): si este movimiento (un egreso real) fue
+  // compensado porque se eliminó el registro de Historial que lo originó, queda marcado acá —
+  // así no se puede revertir 2 veces la misma entrega por error.
+  revertidoEn?: string;
+  revertidoPor?: string;
+  motivoReversion?: string;
 }
 
 interface ItemArqueo {
@@ -9341,6 +9372,16 @@ interface OTPivote {
   creadoEn: string;
   observaciones?: string;
   estado: 'pendiente_programar' | 'programado' | 'entregado' | 'anulada';
+  // AGREGADO 26/9/2026 (pedido explícito — "agrega en OT pivote... la casilla para anotar número
+  // OT, quiero que también salga igual que en predictivo si lo necesitamos automático o manual"):
+  // mismo concepto que `numeroOT` en la OT de maquinaria (`FormularioOT`) — el N° de OT del bloc
+  // físico, que puede venir de un folio de la bolsa de Auditoría (automático) o escribirse a mano
+  // (manual). Es DISTINTO de `otRiegoNumero` de abajo: `numeroOT` es el que pone FUMIGACIÓN al
+  // crear la OT Pivote (si lo tiene); `otRiegoNumero` es el que pone RIEGO al programarla. "Que ese
+  // número prevalezca en las 2 aplicaciones": si `numeroOT` ya viene puesto acá, AgriRiego lo usa
+  // como N° de OT al programar (ver `programarDesdeOT`); si NO viene, y Riego pone uno propio al
+  // programar, se replica de vuelta acá (ver `marcarOTPivoteProgramada`, en AgriRiego).
+  numeroOT?: string;
   // Rellenado por AgriRiego cuando la convierte en una Programación real:
   otRiegoNumero?: string;
   fechaProgramadaReal?: string;
@@ -9968,7 +10009,7 @@ function usePivotesRegandoAhora() {
   // AMPLIADO 24/9/2026 (pedido explícito — "debe verse la velocidad del pivote"): `velocidadTexto`
   // ya viene formateado desde AgriRiego (`formatearVelocidadTramo`) — puede ser "100%" o, si los
   // lotes de ese tramo tienen velocidades distintas, "70–100%". No se recalcula acá.
-  const [estadoPublicado, setEstadoPublicado] = useState<Record<string, { status: string; operator: string; lotes: string[]; desde: string | null; horaArranque?: string | null; fechaFinEstimada?: string | null; velocidadTexto?: string | null; producto: { estado: string; productos: string[] } | null }>>({});
+  const [estadoPublicado, setEstadoPublicado] = useState<Record<string, { status: string; operator: string; lotes: string[]; desde: string | null; horaArranque?: string | null; fechaFinEstimada?: string | null; msParo?: number; eventos?: { tipo: string; ts: string; motivo: string }[]; velocidadTexto?: string | null; producto: { estado: string; productos: string[] } | null }>>({});
   // AGREGADO 23/9/2026 (pedido explícito — "y muestra la programacion? y lo que estan pedientes
   // sin regar?"): Programaciones que todavía no arrancaron, por pivote.
   const [programacionesPublicadas, setProgramacionesPublicadas] = useState<Record<string, { fechaProgramada: string; ot: string; lotes: string[]; aplicacion: string; programador: string; velocidadTexto?: string | null }[]>>({});
@@ -10016,7 +10057,7 @@ function usePivotesRegandoAhora() {
     // (puede reanudarse en cualquier momento) hasta que alguien lo cierre de verdad. Ahora se
     // muestran los 3 estados "abiertos" (todo menos LIBRE), cada uno con su propio color, igual
     // que Control en AgriRiego.
-    const resultado: Record<string, { regando: boolean; estado: string; desde: string; horaArranque: string | null; fechaFinEstimada: string | null; velocidadTexto: string | null; operator?: string; lotes: string[]; producto: { estado: string; productos: string[] } | null }> = {};
+    const resultado: Record<string, { regando: boolean; estado: string; desde: string; horaArranque: string | null; fechaFinEstimada: string | null; msParo: number; eventos: { tipo: string; ts: string; motivo: string }[]; velocidadTexto: string | null; operator?: string; lotes: string[]; producto: { estado: string; productos: string[] } | null }> = {};
     Object.entries(estadoPublicado).forEach(([pivote, info]) => {
       resultado[pivote] = {
         regando: info.status === 'REGANDO' || info.status === 'PENDIENTE_CIERRE',
@@ -10024,6 +10065,8 @@ function usePivotesRegandoAhora() {
         desde: info.desde || '',
         horaArranque: info.horaArranque || null,
         fechaFinEstimada: info.fechaFinEstimada || null,
+        msParo: typeof info.msParo === 'number' ? info.msParo : 0,
+        eventos: Array.isArray(info.eventos) ? info.eventos : [],
         velocidadTexto: info.velocidadTexto || null,
         operator: info.operator,
         lotes: info.lotes || [],
@@ -10058,21 +10101,44 @@ function usePivotesRegandoAhora() {
 // FIX 23/9/2026 (2) (pedido explícito — "dice P4L1,3 en vez de decir P4L1L3"): se saca la lógica
 // de rangos con coma y se vuelve a la concatenación simple "L"+número pegado sin separador, que
 // es como el resto de la app (AgriRiego) ya arma secuencias de lotes en todos lados.
+// FIX 27/9/2026 (bug real reportado — "programé P7 L5L4 @70% y muestra L4L5, solo secuencial
+// ascendente, no toma en cuenta al revés"): se ordenaba numéricamente (`.sort`). El orden en que
+// AgriRiego publica los lotes ES el orden de riego (sentido de giro) — se respeta tal cual.
+// También se conserva el sublote (ej. "1a") en vez de descartar las letras.
 function formatearLotesLegible(lotes: string[]): string {
-  const nums = lotes.map(l => parseInt(String(l).replace(/\D/g, ''), 10)).filter(n => !isNaN(n)).sort((a, b) => a - b);
-  return nums.map(n => `L${n}`).join('');
+  const vistos = new Set<string>();
+  return lotes
+    .map(l => String(l).trim().replace(/^L/i, ''))
+    .filter(l => /^\d+[A-Za-z]*$/.test(l))
+    .filter(l => (vistos.has(l) ? false : (vistos.add(l), true)))
+    .map(l => `L${l}`)
+    .join('');
+}
+
+// FIX 27/9/2026 (pedido explícito — "toma por defecto los números con letra"): AgriRiego
+// rellenaba el N° OT de riego con un pedazo del id interno (ej. "7wmh1", "060tz") cuando no se
+// escribía OT. AgriRiego V.8.338+ ya no lo hace, pero los ya guardados siguen en Firestore. Se
+// reconocen porque tienen minúsculas (toda OT escrita a mano pasa a MAYÚSCULAS) y no se muestran.
+function otRiegoLimpia(v: any): string {
+  const s = String(v ?? '').trim();
+  return s && !/[a-z]/.test(s) ? s : '';
 }
 
 // AGREGADO 23/9/2026 (pedido explícito — "no puede mostrar la hora de arranque que horas falta
 // para terminar porcentaje nada?"): a partir de la hora de arranque real + fin estimado que ya
 // viene publicado desde AgriRiego, calcula cuánto tiempo lleva, cuánto falta y el % avanzado.
-function calcularAvancePivote(horaArranque: string | null, fechaFinEstimada: string | null, ahora: Date): { pct: number; faltanTexto: string; vencido: boolean } | null {
+// FIX 27/9/2026 (bug real — P4 paró y reanudó y seguía diciendo "100% · pasó la hora hace
+// 24h"): AgriRiego ahora publica `fechaFinEstimada` ya corrida por TODO el tiempo parado, más
+// `msParo` (ms parados hasta ahora). El % se calcula sobre tiempo de riego REAL:
+// (transcurrido − parado) / (duración total − parado), no sobre reloj de pared.
+function calcularAvancePivote(horaArranque: string | null, fechaFinEstimada: string | null, ahora: Date, msParo: number = 0): { pct: number; faltanTexto: string; vencido: boolean } | null {
   if (!horaArranque || !fechaFinEstimada) return null;
   const ini = new Date(horaArranque).getTime();
   const fin = new Date(fechaFinEstimada).getTime();
   const now = ahora.getTime();
   if (isNaN(ini) || isNaN(fin) || fin <= ini) return null;
-  const pct = Math.max(0, Math.min(100, Math.round(((now - ini) / (fin - ini)) * 100)));
+  const paro = Math.max(0, Math.min(msParo || 0, fin - ini - 1));
+  const pct = Math.max(0, Math.min(100, Math.round(((now - ini - paro) / (fin - ini - paro)) * 100)));
   const msFaltan = fin - now;
   const vencido = msFaltan <= 0;
   const minAbs = Math.round(Math.abs(msFaltan) / 60000);
@@ -10081,14 +10147,90 @@ function calcularAvancePivote(horaArranque: string | null, fechaFinEstimada: str
   return { pct, faltanTexto: vencido ? `pasó la hora hace ${texto}` : `faltan ${texto}`, vencido };
 }
 
+// AGREGADO 26/9/2026 (extraído de `PestanaOTPivote` al reorganizar la vista — ver comentario
+// "necesito que organices esa vista..." más abajo): la tarjeta de una OT Pivote, sin cambios en
+// su contenido ni su lógica, solo movida a un componente aparte para poder listarla en 2 lugares
+// (Pendientes / Historial) sin duplicar el JSX.
+function TarjetaOTPivoteListado({ ot, rol, badge, arranquesPorOTRiego, anularOT, eliminarOT }: {
+  ot: OTPivote; rol: Rol;
+  badge: (estado: OTPivote['estado']) => JSX.Element | undefined;
+  arranquesPorOTRiego: Record<string, any>;
+  anularOT: (ot: OTPivote) => void;
+  eliminarOT: (ot: OTPivote) => void;
+}) {
+  return (
+    <div className={`border rounded-lg p-3 ${ot.estado === 'anulada' ? 'bg-gray-50 border-gray-200 opacity-60' : 'bg-white border-gray-200'}`}>
+      <div className="flex items-start justify-between flex-wrap gap-1">
+        <div>
+          <p className="font-bold text-gray-800 text-sm">💧 {ot.pivote} — {ot.lotes.join(', ')}{ot.numeroOT ? ` · N° ${ot.numeroOT}` : ''}</p>
+          <p className="text-xs text-gray-500">Fecha sugerida: {ot.fechaSugerida} · {ot.campaña}</p>
+          <p className="text-[11px] text-gray-400">Creada por {ot.creadoPor} · {new Date(ot.creadoEn).toLocaleString('es-BO')}</p>
+        </div>
+        {badge(ot.estado)}
+      </div>
+      {ot.observaciones && <p className="text-xs text-gray-600 mt-1 italic">"{ot.observaciones}"</p>}
+      <div className="mt-2 space-y-1">
+        {ot.productos.map((p, i) => (
+          <p key={i} className="text-xs text-gray-700">• {p.nombre} — {p.dosis} {p.unidad}/ha</p>
+        ))}
+      </div>
+      {/* REDISEÑO 23/9/2026 (pedido explícito — "todo la hora de arranque, tiempo estimado
+          q termina osea mas o menos una vista desplegable como en pestaña OT de bitacora"):
+          antes era una sola línea fija; ahora es un desplegable con el detalle real de
+          ejecución que se lee en vivo desde AgriRiego (hora de arranque real, fin estimado)
+          — no solo la fecha PLANEADA que quedó grabada acá al momento de programar. */}
+      {(ot.estado === 'programado' || ot.estado === 'entregado') && (() => {
+        const ejec = otRiegoLimpia(ot.otRiegoNumero) ? arranquesPorOTRiego[otRiegoLimpia(ot.otRiegoNumero)] : undefined;
+        return (
+          <details className="mt-2 bg-amber-50 rounded px-2 py-1.5 text-xs">
+            <summary className="cursor-pointer font-semibold text-amber-800">
+              🗓️ OT Riego {otRiegoLimpia(ot.otRiegoNumero) || '—'} — programada {ot.fechaProgramadaReal || '—'}
+              {ejec ? <span className="text-emerald-700"> · ✅ arrancó</span> : <span className="text-gray-500"> · aún no arranca</span>}
+            </summary>
+            <div className="mt-1.5 space-y-0.5 text-gray-700">
+              <p>Programado por: {ot.programadoPor || '—'}</p>
+              {ejec ? (
+                <>
+                  <p>Hora de arranque real: <b>{new Date(ejec.horaArranqueReal).toLocaleString('es-BO', { hour12: false })}</b>{ejec.operator ? ` (${ejec.operator})` : ''}</p>
+                  <p>Duración estimada: <b>{ejec.hrsEstimadas ? `${ejec.hrsEstimadas.toFixed(1)} h` : '—'}</b></p>
+                  <p>Hora estimada de fin: <b>{ejec.fechaFinEstimada ? new Date(ejec.fechaFinEstimada).toLocaleString('es-BO', { hour12: false }) : '—'}</b></p>
+                  <p className="text-[10px] text-gray-400">Ojo: es una estimación calculada por AgriRiego al momento de arrancar (según velocidad y pasadas) — si el riego se corta o se retoma en el medio, puede correrse.</p>
+                </>
+              ) : (
+                <p className="text-gray-500">Todavía no se arrancó este riego en AgriRiego.</p>
+              )}
+            </div>
+          </details>
+        );
+      })()}
+      {ot.estado === 'anulada' && ot.motivoAnulacion && (
+        <p className="text-xs text-gray-500 mt-2">Motivo: {ot.motivoAnulacion}</p>
+      )}
+      {rol === 'maestro' && (ot.estado === 'pendiente_programar' || ot.estado === 'programado') && (
+        // FIX 26/9/2026 (pedido explícito): antes esto solo aparecía en 'pendiente_programar' —
+        // una OT ya programada (aunque fuera una prueba cargada por error) no se podía anular
+        // desde la pantalla.
+        <button onClick={() => anularOT(ot)} className="mt-2 text-xs text-red-600 font-semibold">✕ Anular</button>
+      )}
+      {rol === 'maestro' && (
+        <button onClick={() => eliminarOT(ot)} className="mt-2 ml-3 text-xs text-gray-400 hover:text-red-700 font-semibold">🗑 Eliminar definitivamente</button>
+      )}
+    </div>
+  );
+}
+
 function PestanaOTPivote({
   rol,
   campanaActiva,
   usuarioActivo,
+  rangosFolios,
+  folioHistorial,
 }: {
   rol: Rol;
   campanaActiva: string;
   usuarioActivo: string;
+  rangosFolios: RangoFolios[];
+  folioHistorial: FolioHistorial[];
 }) {
   const [otsPivote, setOtsPivote] = useState<OTPivote[]>([]);
   const [cargando, setCargando] = useState(true);
@@ -10107,9 +10249,75 @@ function PestanaOTPivote({
     return () => clearInterval(t);
   }, []);
 
+  // AGREGADO 24/9/2026 (pedido explícito — "en agrifumiga en OT pivote pone o crea otra pestaña
+  // ahí" — calendario de aplicaciones de foliar/EM/fertilizantes que AgriRiego importa de la
+  // planilla de Cultivos, ver `calendarioAplicaciones` en su App.tsx): solo lectura acá — la carga
+  // del Excel vive del lado de AgriRiego, esto solo evita que fumigación tenga que ir y volver
+  // entre las dos apps para ver el mismo calendario. Se lee vía `riegoDb`, mismo patrón inverso
+  // que ya usa este componente para `registrosRiego`/`estadoPivotesActual`.
+  const [subVistaPivote, setSubVistaPivote] = useState<'otpivote' | 'calendario'>('otpivote');
+  const [calendarioCultivos, setCalendarioCultivos] = useState<any[]>([]);
+  useEffect(() => {
+    const unsub = onSnapshot(collection(riegoDb, 'artifacts', RIEGO_DB_APP_ID, 'public', 'data', 'calendarioAplicaciones'), (snap) => {
+      setCalendarioCultivos(snap.docs.map(d => d.data()));
+    }, () => {});
+    return () => unsub();
+  }, []);
+  const calendarioCultivosFiltrado = useMemo(() => {
+    // FIX 26/9/2026: `new Date().toISOString()` da la fecha en UTC — entre las 20:00 y 23:59 hora
+    // Bolivia ya cae en el día siguiente en UTC, marcando "vencido" algo que en Bolivia todavía es
+    // de hoy (mismo bug ya documentado arriba, ver `fechaLocalISO`). Se usa esa misma función acá.
+    const hoyStr = fechaLocalISO();
+    return calendarioCultivos
+      .filter((r: any) => r.campana === campanaActiva)
+      .map((r: any) => ({ ...r, vencido: !r.fechaEjecucion && r.fechaPrevista < hoyStr }))
+      .sort((a: any, b: any) => a.fechaPrevista.localeCompare(b.fechaPrevista));
+  }, [calendarioCultivos, campanaActiva]);
+  // FIX 26/9/2026 (bug real reportado — "el calendario foliar muestra los primeros datos de
+  // fecha, tiene que mostrar por defecto fecha de hoy siempre"): antes esto renderizaba TODAS las
+  // filas ordenadas de más vieja a más nueva dentro de una tabla con scroll propio que arranca
+  // arriba del todo — si había meses de historial cargado, lo primero que se veía al abrir la
+  // pestaña eran los registros más viejos, no los de hoy. Mismo patrón ya usado en AgriRiego para
+  // este mismo calendario (ver `calendarioConEstadoRealVisible`/`calendarioHoyRef` en su App.tsx):
+  // por defecto se filtra a vencidos + próximos 7 días, con un botón "Ver todo" para destapar el
+  // historial completo, y un scroll automático a la fila de HOY apenas se abre esta subvista.
+  const [verTodoCalendarioFumiga, setVerTodoCalendarioFumiga] = useState(false);
+  const calendarioCultivosVisible = useMemo(() => {
+    if (verTodoCalendarioFumiga) return calendarioCultivosFiltrado;
+    const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+    const limite = new Date(hoy); limite.setDate(limite.getDate() + 7);
+    return calendarioCultivosFiltrado.filter((r: any) => {
+      if (r.vencido) return true;
+      const f = new Date(r.fechaPrevista + 'T00:00:00');
+      return f >= hoy && f <= limite;
+    });
+  }, [calendarioCultivosFiltrado, verTodoCalendarioFumiga]);
+  const calendarioHoyRef = useRef<HTMLTableRowElement>(null);
+  useEffect(() => {
+    if (subVistaPivote === 'calendario') {
+      const t = setTimeout(() => calendarioHoyRef.current?.scrollIntoView({ block: 'center' }), 80);
+      return () => clearTimeout(t);
+    }
+  }, [subVistaPivote, calendarioCultivosVisible.length]);
+
   useEffect(() => {
     const cached = cacheGet<OTPivote[]>(COL.ot_pivote, []);
     if (cached.length > 0) { setOtsPivote(cached); setCargando(false); }
+    // FIX 26/9/2026 (bug real reportado — "cachea la pestaña OT Pivote, muestra los primeros
+    // datos"): esta pestaña se DESMONTA por completo cada vez que se cambia a otra (ver
+    // `{pestana === 'otpivote' && <PestanaOTPivote .../>}` en el componente padre) — al volver,
+    // arranca de nuevo mostrando lo último que quedó en `localStorage` (`cacheGet`, arriba) y
+    // depende de que el propio `onSnapshot` reconecte solo para ponerse al día, lo cual puede
+    // tardar (mismo problema de fondo que en AgriRiego). Se agrega una lectura forzada al
+    // SERVIDOR (`getDocsFromServer`, ignora tanto este cache local como el cache propio de
+    // Firestore) apenas monta, para no depender de esa espera.
+    getDocsFromServer(collection(db, COL.ot_pivote)).then(snap => {
+      const data = snap.docs.map(d => d.data() as OTPivote)
+        .sort((a, b) => (b.creadoEn || '').localeCompare(a.creadoEn || ''));
+      setOtsPivote(data);
+      cacheSet(COL.ot_pivote, data);
+      setCargando(false);
+    }).catch(() => {});
     const unsub = onSnapshot(collection(db, COL.ot_pivote), (snap) => {
       const data = snap.docs.map(d => d.data() as OTPivote)
         .sort((a, b) => (b.creadoEn || '').localeCompare(a.creadoEn || ''));
@@ -10120,13 +10328,24 @@ function PestanaOTPivote({
     return () => unsub();
   }, []);
 
-  async function crearOT(ot: Omit<OTPivote, 'id' | 'creadoEn' | 'estado'>) {
+  async function crearOT(ot: Omit<OTPivote, 'id' | 'creadoEn' | 'estado'>, folioElegido?: number) {
     const id = `otpiv_${Date.now()}`;
-    const doc: OTPivote = { ...ot, id, creadoPor: ot.creadoPor?.trim() || usuarioActivo, creadoEn: new Date().toISOString(), estado: 'pendiente_programar' };
-    setOtsPivote(prev => [doc, ...prev]);
-    await dbSet(COL.ot_pivote, id, doc);
+    const nuevaOT: OTPivote = { ...ot, id, creadoPor: ot.creadoPor?.trim() || usuarioActivo, creadoEn: new Date().toISOString(), estado: 'pendiente_programar' };
+    setOtsPivote(prev => [nuevaOT, ...prev]);
+    await dbSet(COL.ot_pivote, id, nuevaOT);
+    // AGREGADO 26/9/2026: mismo registro de trazabilidad que ya usa la OT de maquinaria — si el N°
+    // de OT vino de un folio de la bolsa de Auditoría, queda marcado "usado" para que no se pueda
+    // reusar en otro documento físico.
+    if (folioElegido) {
+      const ahora = new Date().toISOString();
+      const registroFolio: FolioHistorial = {
+        id: String(folioElegido), numero: folioElegido, estado: 'usado',
+        otId: id, otNumero: nuevaOT.numeroOT || '', usadoEn: ahora, usadoPor: usuarioActivo,
+      };
+      dbSet(COL.folios_historial, registroFolio.id, registroFolio);
+    }
     setModalNuevo(false);
-    setComprobanteOTPivote(doc);
+    setComprobanteOTPivote(nuevaOT);
   }
 
   async function anularOT(ot: OTPivote) {
@@ -10137,6 +10356,24 @@ function PestanaOTPivote({
     await dbSet(COL.ot_pivote, ot.id, actualizada);
   }
 
+  // AGREGADO 26/9/2026 (pedido explícito — "no existen botones de eliminar en pantalla cuando uno
+  // se equivoca"): antes, la única forma de sacarse de encima una OT Pivote cargada por error
+  // (sobre todo si ya estaba en 'programado', donde "Anular" ni siquiera aparecía) era ir a la
+  // consola de Firebase a mano. Esto borra el documento de verdad — a diferencia de `anularOT`,
+  // que solo cambia el estado y deja el historial — así que pide el PIN de maestro, igual que el
+  // resto de las acciones irreversibles de esta app.
+  async function eliminarOT(ot: OTPivote) {
+    const pin = window.prompt(`PIN de maestro para eliminar DEFINITIVAMENTE la OT de ${ot.pivote} — Lote(s) ${ot.lotes.join(', ')}:`);
+    if (pin === null) return;
+    if (pin !== PIN_MAESTRO) { alert('❌ PIN incorrecto — no se eliminó nada.'); return; }
+    setOtsPivote(prev => prev.filter(o => o.id !== ot.id));
+    try {
+      await deleteDoc(doc(db, COL.ot_pivote, ot.id));
+    } catch (e: any) {
+      alert('❌ No se pudo eliminar en el servidor: ' + (e?.message || 'error desconocido'));
+    }
+  }
+
   const badge = (estado: OTPivote['estado']) => {
     switch (estado) {
       case 'pendiente_programar': return <span className="text-xs bg-sky-100 text-sky-800 px-2 py-0.5 rounded font-bold">💧 PENDIENTE DE PROGRAMAR</span>;
@@ -10145,6 +10382,17 @@ function PestanaOTPivote({
       case 'anulada': return <span className="text-xs bg-gray-200 text-gray-600 px-2 py-0.5 rounded font-bold">✕ ANULADA</span>;
     }
   };
+
+  // AGREGADO 26/9/2026 (pedido explícito — "necesito que organices esa vista todo se ve
+  // mezclado entre OT creada y los riegos... las solicitudes o OT creadas que se vean primero
+  // arriba que los riegos"): antes `otsPivote.map(...)` mostraba TODO junto (pendientes,
+  // programadas, entregadas, anuladas) en una sola lista, debajo de los 3 paneles de estado de
+  // riego (que leen AgriRiego) — quedaba todo mezclado y las OT recién creadas se veían recién
+  // al final de la pantalla. Se separa igual que ya hace AgriRiego con esta misma data en su
+  // propia Almacén → OT Pivote (`pendientes`/`resueltas`), y la lista entera de OTs pasa a ir
+  // ARRIBA de los paneles de riego (ver el reordenamiento más abajo en el JSX).
+  const otsPivotePendientes = otsPivote.filter(o => o.estado === 'pendiente_programar');
+  const otsPivoteHistorial = otsPivote.filter(o => o.estado !== 'pendiente_programar');
 
   if (cargando) return <div className="flex justify-center py-20 text-gray-400"><p>⏳ Cargando...</p></div>;
 
@@ -10157,6 +10405,8 @@ function PestanaOTPivote({
       <FormularioOTPivote
         campanaActiva={campanaActiva}
         usuarioActivo={usuarioActivo}
+        rangosFolios={rangosFolios}
+        folioHistorial={folioHistorial}
         onCancelar={() => setModalNuevo(false)}
         onGuardar={crearOT}
       />
@@ -10166,6 +10416,87 @@ function PestanaOTPivote({
   return (
     <>
     <div className="space-y-3">
+      {/* AGREGADO 24/9/2026 (pedido explícito — "en agrifumiga en ot pivote pone o crea otra
+          pestaña ahí"): toggle simple entre las OT Pivote de siempre y el calendario de
+          foliar/EM/fertilizantes que sube AgriRiego — mismo dato en las dos apps. */}
+      <div className="flex gap-1.5">
+        <button type="button" onClick={() => setSubVistaPivote('otpivote')} className={`px-3 py-1.5 text-xs font-bold rounded ${subVistaPivote === 'otpivote' ? 'bg-sky-600 text-white' : 'bg-gray-100 text-gray-600'}`}>OT Pivote</button>
+        <button type="button" onClick={() => setSubVistaPivote('calendario')} className={`px-3 py-1.5 text-xs font-bold rounded ${subVistaPivote === 'calendario' ? 'bg-sky-600 text-white' : 'bg-gray-100 text-gray-600'}`}>
+          Calendario Foliar/EM{calendarioCultivosFiltrado.filter((r: any) => r.vencido).length > 0 ? ` (${calendarioCultivosFiltrado.filter((r: any) => r.vencido).length})` : ''}
+        </button>
+      </div>
+
+      {subVistaPivote === 'calendario' && (
+        <div className="bg-white rounded shadow overflow-hidden">
+          <div className="bg-gray-800 px-4 py-2.5">
+            <span className="text-white font-bold text-sm">Calendario de Aplicaciones (Foliar / EM / Fertilizantes base)</span>
+          </div>
+          <div className="p-4 space-y-3">
+            <p className="text-xs text-gray-500">Lo sube Riego desde la planilla de Cultivos — acá es solo lectura. No bloquea nada (son fertilizantes, sin período de reingreso), es para coordinar quién aplica qué y cuándo.</p>
+            {calendarioCultivosFiltrado.length > 0 && (
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] text-gray-400">{verTodoCalendarioFumiga ? `Mostrando las ${calendarioCultivosVisible.length} filas.` : `Mostrando vencidos + próximos 7 días (${calendarioCultivosVisible.length} de ${calendarioCultivosFiltrado.length}).`}</span>
+                <button type="button" onClick={() => setVerTodoCalendarioFumiga(v => !v)} className="text-[10px] font-bold uppercase bg-gray-100 hover:bg-gray-200 text-gray-600 px-2 py-1 rounded shrink-0">
+                  {verTodoCalendarioFumiga ? 'Ver solo próximos' : 'Ver todo el calendario'}
+                </button>
+              </div>
+            )}
+            {calendarioCultivosFiltrado.length === 0 ? (
+              <p className="text-xs text-gray-400 italic">Todavía no hay calendario importado para esta campaña.</p>
+            ) : calendarioCultivosVisible.length === 0 ? (
+              <p className="text-xs text-gray-400 italic">Nada vencido ni en los próximos 7 días. <button type="button" onClick={() => setVerTodoCalendarioFumiga(true)} className="underline font-bold">Ver todo el calendario</button>.</p>
+            ) : (
+              <div className="overflow-x-auto max-h-[28rem] overflow-y-auto">
+                <table className="w-full text-xs min-w-[600px]">
+                  <thead className="bg-gray-50 sticky top-0"><tr>
+                    <th className="p-1.5 text-left font-bold text-gray-500">Fecha prevista</th>
+                    <th className="p-1.5 text-left font-bold text-gray-500">Pivote · Lote</th>
+                    <th className="p-1.5 text-left font-bold text-gray-500">Producto</th>
+                    <th className="p-1.5 text-left font-bold text-gray-500">Dosis</th>
+                    <th className="p-1.5 text-left font-bold text-gray-500">Ejecución</th>
+                  </tr></thead>
+                  <tbody>
+                    {(() => {
+                      const hoyStr = fechaLocalISO();
+                      let hoyInsertado = false;
+                      const filas: any[] = [];
+                      calendarioCultivosVisible.forEach((r: any) => {
+                        if (!hoyInsertado && r.fechaPrevista >= hoyStr) {
+                          filas.push(
+                            <tr key="__hoy__" ref={calendarioHoyRef} className="bg-blue-50">
+                              <td colSpan={5} className="px-1.5 py-1 text-[10px] font-black uppercase text-blue-700 border-y-2 border-blue-300">📅 Hoy — {new Date().toLocaleDateString('es-BO', { weekday: 'long', day: '2-digit', month: '2-digit' })}</td>
+                            </tr>
+                          );
+                          hoyInsertado = true;
+                        }
+                        filas.push(
+                          <tr key={r.id} className={`border-t border-gray-100 ${r.vencido ? 'bg-amber-50' : ''}`}>
+                            <td className="p-1.5 font-semibold">{r.fechaPrevista}{r.vencido && <span className="ml-1 text-amber-600" title="Pasó la fecha prevista y Riego no la marcó ejecutada">⚠</span>}</td>
+                            <td className="p-1.5 font-bold">{r.pivote} · L{r.lote}</td>
+                            <td className="p-1.5">{r.producto}</td>
+                            <td className="p-1.5 text-gray-500">{r.dosis ?? '—'}</td>
+                            <td className="p-1.5">{r.fechaEjecucion ? <span className="text-emerald-600 font-semibold">✓ {r.fechaEjecucion}</span> : <span className="text-gray-400">pendiente</span>}</td>
+                          </tr>
+                        );
+                      });
+                      if (!hoyInsertado) {
+                        filas.push(
+                          <tr key="__hoy__" ref={calendarioHoyRef}>
+                            <td colSpan={5} className="px-1.5 py-1 text-[10px] font-black uppercase text-blue-700 border-y-2 border-blue-300 bg-blue-50">📅 Hoy — {new Date().toLocaleDateString('es-BO', { weekday: 'long', day: '2-digit', month: '2-digit' })} (nada previsto)</td>
+                          </tr>
+                        );
+                      }
+                      return filas;
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {subVistaPivote === 'otpivote' && (<>
       <div className="flex items-center justify-between flex-wrap gap-2">
         <p className="text-sm text-gray-600">
           Orden de aplicación con pivote — la crea fumigación acá, la programa Riego en su propia app.
@@ -10174,6 +10505,37 @@ function PestanaOTPivote({
           <button onClick={() => setModalNuevo(true)} className="bg-sky-600 text-white px-3 py-1.5 rounded text-sm font-semibold">+ Nueva OT Pivote</button>
         )}
       </div>
+
+      {/* AGREGADO 26/9/2026 (pedido explícito — "necesito que organices esa vista todo se ve
+          mezclado entre OT creada y los riegos... las solicitudes o OT creadas que se vean
+          primero arriba que los riegos, necesito que todo sea bien identificado"): esta lista
+          (antes al FINAL de la pantalla, mezclada en una sola tira sin separar pendientes de
+          historial) pasa a ir PRIMERO, antes que los 3 paneles de estado de riego (que son
+          lectura de AgriRiego, no lo que fumigación pidió) — y se separa en Pendientes/Historial,
+          mismo criterio que ya usa AgriRiego para esta misma data en su Almacén → OT Pivote. */}
+      <div className="border border-sky-200 rounded-lg p-3 bg-sky-50/40">
+        <h3 className="text-sm font-black text-sky-900 uppercase mb-2 flex items-center gap-1.5">📋 OTs Pivote pendientes de programar ({otsPivotePendientes.length})</h3>
+        {otsPivotePendientes.length === 0 ? (
+          <p className="text-xs text-gray-400 py-2">Ninguna pendiente — todas las OT ya fueron programadas por Riego.</p>
+        ) : (
+          <div className="space-y-2">
+            {otsPivotePendientes.map(ot => (
+              <TarjetaOTPivoteListado key={ot.id} ot={ot} rol={rol} badge={badge} arranquesPorOTRiego={arranquesPorOTRiego} anularOT={anularOT} eliminarOT={eliminarOT} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {otsPivoteHistorial.length > 0 && (
+        <details className="border border-gray-200 rounded-lg p-3 bg-white">
+          <summary className="text-sm font-black text-gray-700 uppercase cursor-pointer">📜 Historial de OTs Pivote ({otsPivoteHistorial.length})</summary>
+          <div className="space-y-2 mt-2">
+            {otsPivoteHistorial.map(ot => (
+              <TarjetaOTPivoteListado key={ot.id} ot={ot} rol={rol} badge={badge} arranquesPorOTRiego={arranquesPorOTRiego} anularOT={anularOT} eliminarOT={eliminarOT} />
+            ))}
+          </div>
+        </details>
+      )}
 
       {/* AGREGADO 23/9/2026 — "de igual forma agrifumiga vea lo que se rego y que pivotes estan
           regando, para ellos programar su fumigacion". Lectura en vivo, solo-lectura, del proyecto
@@ -10201,7 +10563,20 @@ function PestanaOTPivote({
               <div className="flex flex-wrap gap-2">
                 {abiertos.map(([pivote, v]) => {
                   const est = estiloPorEstado[v.estado] || estiloPorEstado.REGANDO;
-                  const avance = calcularAvancePivote(v.horaArranque, v.fechaFinEstimada, nowPivote);
+                  // FIX 24/9/2026 (bug real reportado, con captura — "aqui el riego ya va terminar
+                  // P9B y en agrifumiga esta parado, se paro en la tarde por horario de pico"):
+                  // `calcularAvancePivote` contaba el % contra el reloj de PARED actual, sin
+                  // importar si el pivote seguía moviéndose o no — un PARO_ACTIVO (corte, lluvia,
+                  // horario de pico) seguía "avanzando" solo porque pasaba el tiempo, mostrando
+                  // "99% · faltan 3min" para un pivote que en realidad está detenido desde la tarde
+                  // y no se movió un grado más desde entonces. AgriRiego ya resuelve este mismo
+                  // problema en su propia Bitácora (`calcularFracTotalEnVivo`, más arriba en
+                  // App.tsx) congelando el reloj en el momento del PARO — acá se aplica el mismo
+                  // criterio: si está PARO_ACTIVO, el % y el "faltan" se calculan como si "ahora"
+                  // fuera el momento en que se detuvo (`v.desde`, que para un PARO_ACTIVO es
+                  // justamente la hora de ese paro), no el reloj real.
+                  const ahoraEfectivaPivote = v.estado === 'PARO_ACTIVO' && v.desde ? new Date(v.desde) : nowPivote;
+                  const avance = calcularAvancePivote(v.horaArranque, v.fechaFinEstimada, ahoraEfectivaPivote, v.msParo || 0);
                   return (
                     <div key={pivote} className={`border rounded px-2 py-1 text-xs ${est.clase}`}>
                       <span className="font-bold">{est.icono} {pivote}</span>
@@ -10232,9 +10607,26 @@ function PestanaOTPivote({
                               <span className="w-16 h-1.5 bg-black/10 rounded-full overflow-hidden inline-block align-middle">
                                 <span className={`h-full block ${avance.vencido ? 'bg-red-500' : 'bg-blue-500'}`} style={{ width: `${avance.pct}%` }} />
                               </span>
-                              <span className={avance.vencido ? 'font-bold text-red-700' : 'text-gray-500'}>{avance.pct}% · {avance.faltanTexto}</span>
+                              <span className={avance.vencido ? 'font-bold text-red-700' : 'text-gray-500'}>
+                                {avance.pct}% · {avance.faltanTexto}
+                                {v.estado === 'PARO_ACTIVO' && <span className="italic"> (al detenerse — no avanza)</span>}
+                              </span>
                             </>
                           )}
+                        </div>
+                      )}
+                      {/* AGREGADO 27/9/2026 (pedido explícito — "no se refleja nada de los
+                          arranques y paro"): paros y reanudaciones de ESTE riego, publicados
+                          por AgriRiego (V.8.339+). */}
+                      {v.eventos.length > 0 && (
+                        <div className="w-full mt-1 pt-1 border-t border-black/10 flex flex-wrap gap-x-2 gap-y-0.5 text-[11px]">
+                          {v.eventos.map((e, i) => (
+                            <span key={i} className={e.tipo === 'PARO' ? 'text-red-700' : 'text-blue-700'}>
+                              {e.tipo === 'PARO' ? '🛑' : '▶️'} {e.ts ? new Date(e.ts).toLocaleString('es-BO', { hour12: false, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}
+                              {e.tipo === 'PARO' ? (e.motivo ? ` ${e.motivo}` : ' paro') : ' reanudó'}
+                            </span>
+                          ))}
+                          {v.msParo > 0 && <span className="text-gray-500">· parado en total {Math.floor(v.msParo / 3600000)}h {Math.round((v.msParo % 3600000) / 60000)}min</span>}
                         </div>
                       )}
                     </div>
@@ -10261,7 +10653,7 @@ function PestanaOTPivote({
                   {p.lotes.length > 0 && <span className="text-gray-500"> · {formatearLotesLegible(p.lotes)}</span>}
                   {p.velocidadTexto && <span className="text-gray-500"> · Vel: {p.velocidadTexto}</span>}
                   {p.aplicacion === 'AGROQUIMICOS' && <span className="ml-1 bg-amber-100 text-amber-800 rounded px-1 font-bold">🧪 con químico</span>}
-                  {p.ot && <span className="text-gray-400"> · OT {p.ot}</span>}
+                  {otRiegoLimpia(p.ot) && <span className="text-gray-400"> · OT {otRiegoLimpia(p.ot)}</span>}
                 </div>
               ))
             )}
@@ -10296,63 +10688,10 @@ function PestanaOTPivote({
         </div>
       )}
 
-      {otsPivote.length === 0 && <p className="text-center text-gray-400 text-sm py-8">Sin OTs de pivote todavía.</p>}
-
-      <div className="space-y-2">
-        {otsPivote.map(ot => (
-          <div key={ot.id} className={`border rounded-lg p-3 ${ot.estado === 'anulada' ? 'bg-gray-50 border-gray-200 opacity-60' : 'bg-white border-gray-200'}`}>
-            <div className="flex items-start justify-between flex-wrap gap-1">
-              <div>
-                <p className="font-bold text-gray-800 text-sm">💧 {ot.pivote} — {ot.lotes.join(', ')}</p>
-                <p className="text-xs text-gray-500">Fecha sugerida: {ot.fechaSugerida} · {ot.campaña}</p>
-                <p className="text-[11px] text-gray-400">Creada por {ot.creadoPor} · {new Date(ot.creadoEn).toLocaleString('es-BO')}</p>
-              </div>
-              {badge(ot.estado)}
-            </div>
-            {ot.observaciones && <p className="text-xs text-gray-600 mt-1 italic">"{ot.observaciones}"</p>}
-            <div className="mt-2 space-y-1">
-              {ot.productos.map((p, i) => (
-                <p key={i} className="text-xs text-gray-700">• {p.nombre} — {p.dosis} {p.unidad}/ha</p>
-              ))}
-            </div>
-            {/* REDISEÑO 23/9/2026 (pedido explícito — "todo la hora de arranque, tiempo estimado
-                q termina osea mas o menos una vista desplegable como en pestaña OT de bitacora"):
-                antes era una sola línea fija; ahora es un desplegable con el detalle real de
-                ejecución que se lee en vivo desde AgriRiego (hora de arranque real, fin estimado)
-                — no solo la fecha PLANEADA que quedó grabada acá al momento de programar. */}
-            {(ot.estado === 'programado' || ot.estado === 'entregado') && (() => {
-              const ejec = ot.otRiegoNumero ? arranquesPorOTRiego[ot.otRiegoNumero] : undefined;
-              return (
-                <details className="mt-2 bg-amber-50 rounded px-2 py-1.5 text-xs">
-                  <summary className="cursor-pointer font-semibold text-amber-800">
-                    🗓️ OT Riego {ot.otRiegoNumero || '—'} — programada {ot.fechaProgramadaReal || '—'}
-                    {ejec ? <span className="text-emerald-700"> · ✅ arrancó</span> : <span className="text-gray-500"> · aún no arranca</span>}
-                  </summary>
-                  <div className="mt-1.5 space-y-0.5 text-gray-700">
-                    <p>Programado por: {ot.programadoPor || '—'}</p>
-                    {ejec ? (
-                      <>
-                        <p>Hora de arranque real: <b>{new Date(ejec.horaArranqueReal).toLocaleString('es-BO', { hour12: false })}</b>{ejec.operator ? ` (${ejec.operator})` : ''}</p>
-                        <p>Duración estimada: <b>{ejec.hrsEstimadas ? `${ejec.hrsEstimadas.toFixed(1)} h` : '—'}</b></p>
-                        <p>Hora estimada de fin: <b>{ejec.fechaFinEstimada ? new Date(ejec.fechaFinEstimada).toLocaleString('es-BO', { hour12: false }) : '—'}</b></p>
-                        <p className="text-[10px] text-gray-400">Ojo: es una estimación calculada por AgriRiego al momento de arrancar (según velocidad y pasadas) — si el riego se corta o se retoma en el medio, puede correrse.</p>
-                      </>
-                    ) : (
-                      <p className="text-gray-500">Todavía no se arrancó este riego en AgriRiego.</p>
-                    )}
-                  </div>
-                </details>
-              );
-            })()}
-            {ot.estado === 'anulada' && ot.motivoAnulacion && (
-              <p className="text-xs text-gray-500 mt-2">Motivo: {ot.motivoAnulacion}</p>
-            )}
-            {rol === 'maestro' && ot.estado === 'pendiente_programar' && (
-              <button onClick={() => anularOT(ot)} className="mt-2 text-xs text-red-600 font-semibold">✕ Anular</button>
-            )}
-          </div>
-        ))}
-      </div>
+      {/* Lista de OTs Pivote — movida arriba de este bloque (ver "📋 OTs Pivote" al inicio de esta
+          vista, separada en Pendientes/Historial). Se deja este comentario como referencia de
+          dónde vivía antes (23/9/2026 → 26/9/2026). */}
+      </>)}
     </div>
     {comprobanteOTPivote && (
       <ModalCompartirWhatsApp
@@ -10374,12 +10713,14 @@ function PestanaOTPivote({
 // validación técnica: eso es de fumigación con máquina, esto es una orden simple para que Riego
 // programe una aplicación con pivote).
 function FormularioOTPivote({
-  campanaActiva, usuarioActivo, onCancelar, onGuardar,
+  campanaActiva, usuarioActivo, onCancelar, onGuardar, rangosFolios, folioHistorial,
 }: {
   campanaActiva: string;
   usuarioActivo: string;
   onCancelar: () => void;
-  onGuardar: (ot: Omit<OTPivote, 'id' | 'creadoEn' | 'estado'>) => void;
+  onGuardar: (ot: Omit<OTPivote, 'id' | 'creadoEn' | 'estado'>, folioElegido?: number) => void;
+  rangosFolios: RangoFolios[];
+  folioHistorial: FolioHistorial[];
 }) {
   const [pivote, setPivote] = useState('');
   const [lotes, setLotes] = useState('');
@@ -10388,6 +10729,22 @@ function FormularioOTPivote({
   const [registradoPor, setRegistradoPor] = useState(usuarioActivo || '');
   const [observaciones, setObservaciones] = useState('');
   const [productos, setProductos] = useState<ProductoOTPivote[]>([{ nombre: '', dosis: 0, unidad: 'L' }]);
+  // AGREGADO 26/9/2026 (pedido explícito — "agrega en OT pivote... la casilla para anotar número
+  // OT, quiero que también salga igual que en predictivo si lo necesitamos automático o manual"):
+  // mismo mecanismo que ya existe en la OT de maquinaria (`FormularioOT`) — escribir el N° a mano
+  // (bloc físico), O elegir uno de la bolsa de folios de Auditoría (automático, evita repetir
+  // números). Es opcional: si no se pone nada acá, AgriRiego puede poner el suyo al programar, y
+  // ese se replica de vuelta a esta OT (ver `marcarOTPivoteProgramada` en AgriRiego).
+  const [numeroOT, setNumeroOT] = useState('');
+  const [folioElegido, setFolioElegido] = useState<number | undefined>(undefined);
+  const numerosUsadosOEliminados = new Set(folioHistorial.map((h) => h.numero));
+  const foliosDisponibles: number[] = [];
+  rangosFolios.forEach((r) => {
+    for (let n = r.desde; n <= r.hasta; n++) {
+      if (!numerosUsadosOEliminados.has(n)) foliosDisponibles.push(n);
+    }
+  });
+  foliosDisponibles.sort((a, b) => a - b);
 
   function actualizarProducto(i: number, campo: keyof ProductoOTPivote, valor: string) {
     setProductos(prev => prev.map((p, idx) => idx === i ? { ...p, [campo]: campo === 'dosis' ? (parseFloat(valor) || 0) : valor } : p));
@@ -10405,7 +10762,8 @@ function FormularioOTPivote({
       fechaSugerida, horaSugerida: horaSugerida || undefined,
       campaña: campanaActiva, observaciones: observaciones.trim() || undefined,
       creadoPor: registradoPor.trim(),
-    });
+      numeroOT: numeroOT.trim() || undefined,
+    }, folioElegido);
   }
 
   return (
@@ -10423,19 +10781,9 @@ function FormularioOTPivote({
       </div>
       <p className="text-sm text-gray-500 -mt-4">Orden para que Riego programe una aplicación con pivote — no consume stock acá, solo dispara la solicitud a Almacén cuando Riego la programa de verdad.</p>
 
-      {/* Lotes que cubre esta OT — mismo patrón que la OT de maquinaria */}
-      <section>
-        <h3 className="font-semibold text-gray-700 mb-3 text-sm uppercase tracking-wide">📍 Lotes que cubre esta OT</h3>
-        <input
-          type="text"
-          value={lotes}
-          onChange={e => setLotes(e.target.value)}
-          placeholder="P6-L3, P6-L4 (separar por coma)"
-          className="input"
-        />
-        <p className="text-xs text-gray-500 mt-1">Escriba los lotes separados por coma</p>
-      </section>
-
+      {/* FIX 26/9/2026 (pedido explícito — "primero sale para poner el lote antes que escoger el
+          pivote, y no es así ¿cierto?"): correcto, estaba al revés. Cabecera (con el selector de
+          Pivote) va primero; recién ahí tiene sentido pedir los lotes de ESE pivote. */}
       {/* Cabecera */}
       <section>
         <h3 className="font-semibold text-gray-700 mb-3 text-sm uppercase tracking-wide">Cabecera</h3>
@@ -10445,6 +10793,32 @@ function FormularioOTPivote({
               <option value="">— Seleccionar —</option>
               {PIVOTES_LISTA.map(p => <option key={p}>{p}</option>)}
             </select>
+          </Campo>
+          <Campo label="N° OT (opcional — del bloc físico, si tiene)">
+            <input
+              type="text"
+              value={numeroOT}
+              onChange={(e) => { setNumeroOT(e.target.value); setFolioElegido(undefined); }}
+              placeholder="0020612"
+              className="input"
+            />
+            {foliosDisponibles.length > 0 && (
+              <div className="mt-1">
+                <select
+                  value={folioElegido ?? ''}
+                  onChange={(e) => {
+                    const n = e.target.value ? parseInt(e.target.value) : undefined;
+                    setFolioElegido(n);
+                    if (n) setNumeroOT(String(n));
+                  }}
+                  className="input text-xs w-full"
+                >
+                  <option value="">— o elegí un folio de Auditoría ({foliosDisponibles.length} disponibles) —</option>
+                  {foliosDisponibles.slice(0, 200).map((n) => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </div>
+            )}
+            <p className="text-[10px] text-gray-400 mt-0.5">Si lo deja vacío, Riego puede asignar uno propio al programar.</p>
           </Campo>
           <Campo label="Fecha sugerida">
             <input type="date" value={fechaSugerida} onChange={e => setFechaSugerida(e.target.value)} className="input" />
@@ -10462,6 +10836,19 @@ function FormularioOTPivote({
             />
           </Campo>
         </div>
+      </section>
+
+      {/* Lotes que cubre esta OT — mismo patrón que la OT de maquinaria */}
+      <section>
+        <h3 className="font-semibold text-gray-700 mb-3 text-sm uppercase tracking-wide">📍 Lotes que cubre esta OT{pivote ? ` (de ${pivote})` : ''}</h3>
+        <input
+          type="text"
+          value={lotes}
+          onChange={e => setLotes(e.target.value)}
+          placeholder="L3, L4 (separar por coma)"
+          className="input"
+        />
+        <p className="text-xs text-gray-500 mt-1">Escriba los lotes separados por coma</p>
       </section>
 
       {/* Productos — mismo patrón de tabla que la OT de maquinaria, sin columnas de tanque (acá
@@ -10611,6 +10998,13 @@ function PestanaAlmacen({
   // productos"): filtro de categoría opcional, junto al texto libre, para achicar la lista antes
   // de escribir el nombre. Usa las mismas CATEGORIAS_ALMACEN del filtro de Inventario.
   const [matchProductoCategoria, setMatchProductoCategoria] = useState<Record<string, string>>({});
+  // AGREGADO 26/9/2026 (pedido explícito — "al momento de aceptar la solicitud y buscar el
+  // producto... debe de salir por defecto todos y poner texto libre para buscar"): antes la lista
+  // solo aparecía si ya habías escrito algo o elegido una categoría — al hacer foco en el campo,
+  // sin escribir nada, no se veía ningún producto. Ahora, con el campo enfocado, se ve la lista
+  // completa (recortada a las primeras coincidencias) de una, y el texto libre sigue filtrando en
+  // vivo sobre esa misma lista.
+  const [matchProductoAbierto, setMatchProductoAbierto] = useState<Record<string, boolean>>({});
   // AGREGADO 24/9/2026 (pedido explícito — "me preocupa que almacén va a tener que tikear producto
   // por producto y se va a molestar... esto lo estoy haciendo para que funcione y sea fácil"):
   // marca los productos donde el emparejamiento automático por nombre EXACTO fue rechazado a mano
@@ -10944,6 +11338,100 @@ function PestanaAlmacen({
     if (todosEntregados) await registrarHistorialSolicitud(solActualizada);
   }
 
+  // AGREGADO 26/9/2026 (pedido explícito — "en almacén de agrifumiga historial, ahí poneme un
+  // botón de eliminar a cada archivo, pero que pida pin y el motivo porq elimina y se registre
+  // eliminado por tal motivo tal y fecha y hora, así queda arqueado. Y que esa cantidad vuelta a
+  // revertirse a almacén, porq eso lo descuenta cierto?"):
+  // 1) NO se borra la fila — sigue existiendo para siempre (es la planilla permanente, ver
+  //    comentario en `registrarHistorialSolicitud`). Solo se marca `eliminado`, con quién, cuándo
+  //    y el motivo — queda tachada y visible en la tabla, no desaparece del arqueo.
+  // 2) Sí — cada fila de Historial vino de una entrega real que ya descontó stock (un
+  //    MovimientoAlmacen tipo 'egreso', ver `aplicarMovimiento`/`entregarSolicitudCompleta`). Acá
+  //    se ubica ese movimiento original vía el `movimientoId` guardado en la solicitud de origen,
+  //    se le suma la cantidad de vuelta al producto, y se genera un movimiento de tipo 'ingreso'
+  //    que deja registrada la reversión (para que el Kardex cuadre solo, sin tener que ir a hacer
+  //    un ajuste manual aparte). El movimiento original queda marcado `revertidoEn` para que no se
+  //    pueda revertir 2 veces la misma entrega.
+  // 3) Si la solicitud original ya no existe o no se encuentra el movimiento exacto (caso raro —
+  //    se borró algo a mano desde Inventario), se revierte igual por nombre de producto, pero se
+  //    avisa con una advertencia para que alguien lo revise en Inventario.
+  async function eliminarFilaHistorial(fila: FilaHistorialSolicitud) {
+    if (rol !== 'maestro') { alert('Solo el Maestro puede eliminar registros del historial de Almacén.'); return; }
+    if (fila.eliminado) { alert('Este registro ya estaba eliminado.'); return; }
+    const pin = window.prompt(
+      `PIN de Maestro para eliminar el registro de "${fila.producto}" (${fila.cantidad} ${fila.unidad}) — entrega N° ${fila.numeroOrden || '—'}:`
+    );
+    if (pin === null) return;
+    if (pin !== PIN_MAESTRO) { alert('❌ PIN incorrecto — no se eliminó nada.'); return; }
+    const motivo = window.prompt('Motivo de la eliminación (obligatorio — queda registrado en el arqueo):');
+    if (motivo === null) return;
+    if (!motivo.trim()) { alert('Debés indicar un motivo — no se eliminó nada.'); return; }
+    if (!window.confirm(
+      `¿Confirmar eliminación del registro de "${fila.producto}" (${fila.cantidad} ${fila.unidad})?\n\n` +
+      `La cantidad se va a revertir (sumar de nuevo) al stock de Almacén. Esta acción queda registrada con tu nombre, motivo y hora, y no se puede deshacer.`
+    )) return;
+
+    const ahora = new Date().toISOString();
+    const usuarioSesion = usuarioActivo || 'Maestro';
+    const motivoFinal = motivo.trim();
+
+    // 1) Ubicar el movimiento de egreso real que descontó esta cantidad, vía la solicitud origen.
+    const solOriginal = solicitudesRiego.find(s => s.id === fila.solicitudId);
+    const prodEntrySol = solOriginal?.productos.find(
+      (p) => normalizarNombreProducto(p.nombre) === normalizarNombreProducto(fila.producto)
+    );
+    const movOriginal = prodEntrySol?.movimientoId
+      ? movimientos.find((m) => m.id === prodEntrySol.movimientoId)
+      : movimientos.find((m) =>
+          m.tipo === 'egreso' &&
+          m.otNumero === fila.numeroOrden &&
+          normalizarNombreProducto(m.productoNombre) === normalizarNombreProducto(fila.producto) &&
+          Math.abs(m.cantidad - fila.cantidad) < 0.001 &&
+          !m.revertidoEn
+        );
+
+    let advertencia = '';
+    const prod = productos.find((p) =>
+      movOriginal ? p.id === movOriginal.productoId : normalizarNombreProducto(p.nombre) === normalizarNombreProducto(fila.producto)
+    );
+    if (!movOriginal) {
+      advertencia = ' ⚠️ No se encontró el movimiento original de esta entrega — se revirtió el stock por nombre de producto; conviene revisar Inventario.';
+    }
+
+    if (prod && !(movOriginal && movOriginal.revertidoEn)) {
+      const stockAntes = prod.stockActual;
+      const stockDespues = stockAntes + fila.cantidad;
+      await saveProductos(productos.map((p) => (p.id === prod.id ? { ...p, stockActual: stockDespues, actualizadoEn: ahora } : p)));
+      const movReversion: MovimientoAlmacen = {
+        id: `mov_rev_${Date.now()}`,
+        productoId: prod.id, productoNombre: prod.nombre, unidad: prod.unidad,
+        tipo: 'ingreso', cantidad: fila.cantidad, stockAntes, stockDespues,
+        otNumero: fila.numeroOrden, lotes: fila.lotes || [], campaña: fila.campaña,
+        responsable: usuarioSesion,
+        observaciones: `Reversión por eliminación de Historial (entrega ${fila.entregadoEn ? fila.entregadoEn.slice(0, 16).replace('T', ' ') : '—'}) — motivo: ${motivoFinal}`,
+        fecha: fechaLocalISO(),
+        creadoEn: ahora,
+      };
+      const movimientosAct = movOriginal
+        ? movimientos.map((m) => (m.id === movOriginal.id ? { ...m, revertidoEn: ahora, revertidoPor: usuarioSesion, motivoReversion: motivoFinal } : m))
+        : movimientos;
+      await saveMovimientos([movReversion, ...movimientosAct]);
+    } else if (movOriginal && movOriginal.revertidoEn) {
+      advertencia = ' (el stock de esta entrega ya había sido revertido antes — no se volvió a sumar, solo se marcó la fila.)';
+    } else if (!prod) {
+      advertencia = ' ⚠️ No se encontró el producto en Inventario — el stock NO se pudo revertir, avisar a Sistemas.';
+    }
+
+    // 2) Marcar la fila como eliminada — nunca se borra el documento en sí.
+    const filaActualizada: FilaHistorialSolicitud = {
+      ...fila, eliminado: true, eliminadoEn: ahora, eliminadoPor: usuarioSesion, motivoEliminacion: motivoFinal,
+    };
+    setHistorialSolicitudes((prev) => prev.map((f) => (f.id === fila.id ? filaActualizada : f)));
+    await dbSet(COL.almacen_solicitudes_historial, fila.id, filaActualizada);
+
+    if (advertencia) alert(`Registro eliminado y stock revertido.${advertencia}`);
+  }
+
   // ===== VISTAS =====
   const productosFiltrados = productos
     .filter(p => p.activo !== false)
@@ -11200,7 +11688,7 @@ function PestanaAlmacen({
                     <div>
                       <p className="font-bold text-gray-800 text-sm">{origenIcono} {sol.origen === 'maquinaria' ? sol.maquina : sol.pivot} — {sol.lotes.join(', ')}</p>
                       <p className="text-xs text-gray-500">
-                        {sol.origen === 'maquinaria' ? `OT Fumigación: ${sol.otNumero || '—'}` : `OT Riego: ${sol.otRiegoNumero || '—'}`} · Fecha: {sol.fecha} · {sol.campaña}
+                        {sol.origen === 'maquinaria' ? `OT Fumigación: ${sol.otNumero || '—'}` : `OT Riego: ${otRiegoLimpia(sol.otRiegoNumero) || '—'}`} · Fecha: {sol.fecha} · {sol.campaña}
                       </p>
                       <p className="text-[11px] text-gray-400">Pedido por {sol.solicitadoPor} · {new Date(sol.solicitadoEn).toLocaleString('es-BO')}</p>
                       {sol.abiertoPor && <p className="text-[11px] text-amber-600">Atendido por {sol.abiertoPor} · {new Date(sol.abiertoEn!).toLocaleString('es-BO')}</p>}
@@ -11293,6 +11781,7 @@ function PestanaAlmacen({
                                 if (!e.currentTarget.contains(e.relatedTarget as Node)) {
                                   setMatchProductoBusqueda(m => ({ ...m, [key]: '' }));
                                   setMatchProductoCategoria(m => ({ ...m, [key]: '' }));
+                                  setMatchProductoAbierto(m => ({ ...m, [key]: false }));
                                 }
                               }}
                             >
@@ -11307,19 +11796,23 @@ function PestanaAlmacen({
                                 const prodElegido = matchProductoSolicitud[key] ? productos.find(pr => pr.id === matchProductoSolicitud[key]) : null;
                                 const texto = matchProductoBusqueda[key] ?? (prodElegido ? prodElegido.nombre : '');
                                 const categoria = matchProductoCategoria[key] || '';
-                                const mostrarLista = (!!matchProductoBusqueda[key] || !!categoria) && !matchProductoSolicitud[key];
+                                // FIX 26/9/2026: antes exigía texto o categoría para mostrar algo — con el
+                                // campo enfocado (`matchProductoAbierto`) ya se ve la lista completa.
+                                const mostrarLista = !!matchProductoAbierto[key] && !matchProductoSolicitud[key];
                                 const coincidencias = mostrarLista
                                   ? productos.filter(pr => pr.activo !== false
                                       && (!categoria || pr.categoria === categoria)
                                       && (!matchProductoBusqueda[key] || pr.nombre.toLowerCase().includes(matchProductoBusqueda[key].toLowerCase())))
-                                      .sort((a, b) => a.nombre.localeCompare(b.nombre)).slice(0, 25)
+                                      .sort((a, b) => a.nombre.localeCompare(b.nombre)).slice(0, 200)
                                   : [];
                                 return (
                                   <>
                                     <select
                                       value={categoria}
+                                      onFocus={() => setMatchProductoAbierto(m => ({ ...m, [key]: true }))}
                                       onChange={e => {
                                         setMatchProductoCategoria(m => ({ ...m, [key]: e.target.value }));
+                                        setMatchProductoAbierto(m => ({ ...m, [key]: true }));
                                         if (matchProductoSolicitud[key]) setMatchProductoSolicitud(m => ({ ...m, [key]: '' }));
                                       }}
                                       className="input text-xs py-1 max-w-[90px]"
@@ -11331,16 +11824,44 @@ function PestanaAlmacen({
                                     <input
                                       type="text"
                                       value={texto}
-                                      placeholder="Buscar producto..."
+                                      placeholder="Buscar producto... (o tocá para ver todos)"
+                                      onFocus={() => setMatchProductoAbierto(m => ({ ...m, [key]: true }))}
                                       onChange={e => {
                                         const v = e.target.value;
                                         setMatchProductoBusqueda(m => ({ ...m, [key]: v }));
+                                        setMatchProductoAbierto(m => ({ ...m, [key]: true }));
                                         if (matchProductoSolicitud[key]) setMatchProductoSolicitud(m => ({ ...m, [key]: '' }));
                                       }}
                                       className="input text-xs py-1 max-w-[140px]"
                                     />
                                     {mostrarLista && (
-                                      <div className="absolute z-20 top-full left-0 mt-0.5 bg-white border border-gray-200 rounded shadow-lg max-h-44 overflow-y-auto w-56">
+                                      // FIX 26/9/2026 (pedido explícito — "el desplegable no muestra bien en toda
+                                      // la pantalla queda abajo"): antes SIEMPRE se abría hacia abajo
+                                      // (`top-full`), así que si el campo estaba en la mitad inferior de la
+                                      // pantalla, la lista se cortaba contra el borde y quedaba inutilizable.
+                                      // `fixed` + `maxHeight` calculado contra el borde real de la ventana
+                                      // (no un `max-h` fijo) hace que siempre entre completa, se abra donde se
+                                      // abra el campo.
+                                      <div
+                                        ref={(el) => {
+                                          if (!el) return;
+                                          const contenedor = el.parentElement as HTMLElement;
+                                          const r = contenedor.getBoundingClientRect();
+                                          const espacioAbajo = window.innerHeight - r.bottom;
+                                          const espacioArriba = r.top;
+                                          if (espacioAbajo < 180 && espacioArriba > espacioAbajo) {
+                                            el.style.top = 'auto';
+                                            el.style.bottom = `${window.innerHeight - r.top + 2}px`;
+                                            el.style.maxHeight = `${Math.max(120, espacioArriba - 8)}px`;
+                                          } else {
+                                            el.style.top = `${r.bottom + 2}px`;
+                                            el.style.bottom = 'auto';
+                                            el.style.maxHeight = `${Math.max(120, espacioAbajo - 8)}px`;
+                                          }
+                                          el.style.left = `${r.left}px`;
+                                        }}
+                                        className="fixed z-30 bg-white border border-gray-200 rounded shadow-lg overflow-y-auto w-56"
+                                      >
                                         {coincidencias.length === 0 && <p className="px-2 py-1.5 text-xs text-gray-400">Sin resultados</p>}
                                         {coincidencias.map(pr => (
                                           <button key={pr.id} type="button"
@@ -11348,6 +11869,7 @@ function PestanaAlmacen({
                                               setMatchProductoSolicitud(m => ({ ...m, [key]: pr.id }));
                                               setMatchProductoBusqueda(m => ({ ...m, [key]: '' }));
                                               setMatchProductoCategoria(m => ({ ...m, [key]: '' }));
+                                              setMatchProductoAbierto(m => ({ ...m, [key]: false }));
                                             }}
                                             className="block w-full text-left px-2 py-1 text-xs hover:bg-sky-50 border-b border-gray-100 last:border-0">
                                             {pr.nombre} <span className="text-gray-400">({pr.stockActual.toFixed(1)} {pr.unidad})</span>
@@ -11437,7 +11959,7 @@ function PestanaAlmacen({
           return (
           <div className="p-3 space-y-3">
             <div className="flex items-center justify-between flex-wrap gap-2">
-              <p className="text-xs text-gray-500">{ordenGrupos.length} entrega(s) registrada(s) ({historialSolicitudes.length} línea{historialSolicitudes.length===1?'':'s'} de producto) — no se editan ni se borran.</p>
+              <p className="text-xs text-gray-500">{ordenGrupos.length} entrega(s) registrada(s) ({historialSolicitudes.length} línea{historialSolicitudes.length===1?'':'s'} de producto) — no se editan; el Maestro puede eliminar una línea (PIN + motivo) y queda tachada, arqueada, con la cantidad revertida a Almacén.</p>
               <button
                 onClick={() => exportarHistorialSolicitudesExcel(historialSolicitudes)}
                 disabled={historialSolicitudes.length === 0}
@@ -11479,17 +12001,50 @@ function PestanaAlmacen({
                             <th className="px-2 py-1.5 text-left">Producto</th>
                             <th className="px-2 py-1.5 text-right">Cantidad</th>
                             <th className="px-2 py-1.5 text-left">Generó</th>
+                            {rol === 'maestro' && <th className="px-2 py-1.5 text-center">Acción</th>}
                           </tr>
                         </thead>
                         <tbody>
                           {filas.map(f => (
-                            <tr key={f.id} className="border-t border-gray-100">
-                              <td className="px-2 py-1.5">{(f.lotes || []).join(', ') || '—'}</td>
-                              <td className="px-2 py-1.5">{f.producto}{!f.entregadoCompleto && <span className="text-amber-600"> (parcial/estimado)</span>}</td>
-                              <td className="px-2 py-1.5 text-right">{f.cantidad.toFixed(2)} {f.unidad}</td>
-                              <td className="px-2 py-1.5">{f.generadoPor || '—'}</td>
+                            <tr key={f.id} className={`border-t border-gray-100 ${f.eliminado ? 'bg-red-50 text-gray-400' : ''}`}>
+                              <td className={`px-2 py-1.5 ${f.eliminado ? 'line-through' : ''}`}>{(f.lotes || []).join(', ') || '—'}</td>
+                              <td className={`px-2 py-1.5 ${f.eliminado ? 'line-through' : ''}`}>{f.producto}{!f.entregadoCompleto && !f.eliminado && <span className="text-amber-600"> (parcial/estimado)</span>}</td>
+                              <td className={`px-2 py-1.5 text-right ${f.eliminado ? 'line-through' : ''}`}>{f.cantidad.toFixed(2)} {f.unidad}</td>
+                              <td className={`px-2 py-1.5 ${f.eliminado ? 'line-through' : ''}`}>{f.generadoPor || '—'}</td>
+                              {rol === 'maestro' && (
+                                <td className="px-2 py-1.5 text-center">
+                                  {f.eliminado ? (
+                                    <span
+                                      className="text-red-600 font-semibold cursor-help"
+                                      title={`Eliminado por ${f.eliminadoPor || '—'} el ${f.eliminadoEn ? new Date(f.eliminadoEn).toLocaleString('es-BO', { hour12: false }) : '—'}\nMotivo: ${f.motivoEliminacion || '—'}`}
+                                    >
+                                      🗑️ Eliminado
+                                    </span>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => eliminarFilaHistorial(f)}
+                                      title="Eliminar (Maestro) — pide PIN y motivo; revierte la cantidad a Almacén"
+                                      className="text-red-600 hover:text-red-800 font-semibold"
+                                    >
+                                      🗑️
+                                    </button>
+                                  )}
+                                </td>
+                              )}
                             </tr>
                           ))}
+                          {filas.some(f => f.eliminado) && (
+                            <tr className="border-t border-gray-100 bg-red-50/50">
+                              <td colSpan={rol === 'maestro' ? 5 : 4} className="px-2 py-1 text-[11px] text-gray-500">
+                                {filas.filter(f => f.eliminado).map(f => (
+                                  <div key={f.id}>
+                                    🗑️ <strong>{f.producto}</strong> eliminado por {f.eliminadoPor || '—'} el {f.eliminadoEn ? new Date(f.eliminadoEn).toLocaleString('es-BO', { hour12: false }) : '—'} — motivo: {f.motivoEliminacion || '—'}
+                                  </div>
+                                ))}
+                              </td>
+                            </tr>
+                          )}
                         </tbody>
                       </table>
                     </details>
@@ -11510,7 +12065,7 @@ function PestanaAlmacen({
         const prefill = solCtx && prodSol ? {
           tipoApl: (solCtx.origen === 'maquinaria' ? 'maquinaria' : 'pivote') as TipoAplicacion,
           cantidad: String(prodSol.cantidadEstimada),
-          otRiegoNum: solCtx.otRiegoNumero || '',
+          otRiegoNum: otRiegoLimpia(solCtx.otRiegoNumero),
           otNumero: solCtx.otNumero || '',
           maquina: solCtx.maquina || '',
           pivot: solCtx.pivot || '',
